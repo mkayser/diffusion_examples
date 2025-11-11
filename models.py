@@ -1,5 +1,6 @@
 import torch.nn as nn
 import torch
+import math
 
 
 
@@ -19,18 +20,61 @@ class ResBlock(nn.Module):
         out = self.relu(out)
         return out
 
-class SimpleResNet(nn.Module):
-    def __init__(self, c_in: int, c_internal: int):
-        super(SimpleResNet, self).__init__()
+
+def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
+    half = dim // 2
+    freqs = torch.exp(-math.log(1e4) * torch.arange(half) / half)  # 1/ω_k
+    args  = t[:, None] * freqs[None]                                # (B, half)
+    emb   = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)   # (B, dim)
+    return emb
+
+class MLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super(MLP, self).__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(c_in, c_internal, kernel_size=3, padding=1),
-            ResBlock(c_internal),
-            ResBlock(c_internal),
-            nn.Conv2d(c_internal, c_in, kernel_size=3, padding=1)
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
         )
 
     def forward(self, x):
         return self.net(x)
+
+class SimpleResNetWithTimeInput(nn.Module):
+    def __init__(self, c_in: int, temb_dim: int, c_internal: int):
+        super(SimpleResNetWithTimeInput, self).__init__()
+        self.temb_dim = temb_dim
+        self.conv_in = nn.Conv2d(c_in, c_internal, kernel_size=3, padding=1)
+        self.time_mlp = MLP(temb_dim, 256, c_internal)
+        self.resblock1 = ResBlock(c_internal)
+        self.resblock2 = ResBlock(c_internal)
+        self.conv_out = nn.Conv2d(c_internal, c_in, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor):
+        temb = self.time_mlp(timestep_embedding(t, self.temb_dim))   # B, c_internal
+        temb_broadcast = temb[:, :, None, None]  # B, c_internal, 1, 1
+        h = self.conv_in(x)   # B, c_internal, H, W
+        h = h + temb_broadcast   # B, c_internal, H, W
+        h = self.resblock1(h)
+        h = h + temb_broadcast
+        h = self.resblock2(h)
+        out = self.conv_out(h)  # B, c_in, H, W
+        return out
+    
+class SimpleResNet(nn.Module):
+    def __init__(self, c_in: int, c_internal: int):
+        super(SimpleResNet, self).__init__()
+        self.conv_in = nn.Conv2d(c_in, c_internal, kernel_size=3, padding=1)
+        self.resblock1 = ResBlock(c_internal)
+        self.resblock2 = ResBlock(c_internal)
+        self.conv_out = nn.Conv2d(c_internal, c_in, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor):
+        h = self.conv_in(x)   # B, c_internal, H, W
+        h = self.resblock1(h)
+        h = self.resblock2(h)
+        out = self.conv_out(h)  # B, c_in, H, W
+        return out
     
 
 
