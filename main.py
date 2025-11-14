@@ -9,7 +9,7 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 from diffusers import UNet2DModel
 import math
-
+from pathlib import Path
 
 def cosine_abar_to_beta(T: int, 
                         s=0.008, 
@@ -110,6 +110,79 @@ def run_ffs_model():
                 plt.show()
             model.train()
 
+def run_ffs_midi_model():
+    
+    batch_size = 16
+    #K = 4  # data augmentation factor
+    n_epochs = 500
+    lr = 1e-3
+    truncate_training_data_to = 100
+    n_inference_steps = 50
+    perform_inference_every = 10
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    #tfm = transforms.Compose([transforms.Resize((8,8), antialias=True), transforms.ToTensor()])
+    tfm = transforms.ToTensor()
+
+    midi_paths = list(Path("temp_data/maestro-v3.0.0").rglob("*.midi"))
+    ds = mydatasets.MaestroMIDIPianoRollImageDataset(
+        midi_filenames=[str(p) for p in midi_paths[:1]],
+        sample_hz=30,
+        window_width=100,
+        n_samples=100,
+        materialize_all=False
+    )
+
+    #if truncate_training_data_to is not None:
+    #    ds.data = ds.data[:truncate_training_data_to]
+    #    ds.targets = ds.targets[:truncate_training_data_to]
+    
+    dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+    C, H, W = next(iter(dl))[0].shape[1:]  # get image shape
+
+    model = models.SimpleResNetWithTimeInput(1, 32, 16, device=device)
+
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    for epoch in range(n_epochs):
+        epoch_loss = 0.0
+        for x, _ in dl:
+            B = x.size(0)
+            x1 = x.to(device)*2-1.0  # scale to [-1,1]
+            x0 = torch.randn_like(x1)
+            t = torch.rand(B, device=device).reshape(B, 1, 1, 1)
+            xt = (1-t) * x0 + t * x1
+            v = x1 - x0
+            v_pred = model(xt.float(), (1000*t).reshape(B)).sample   # predict v
+            loss = criterion(v_pred, v)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item() * B
+        epoch_loss /= len(dl.dataset)
+        print(f"Epoch {epoch+1}/{n_epochs}, LossPerItem: {epoch_loss:.4f}")
+
+        if (epoch + 1) % perform_inference_every == 0:
+            model.eval()
+            with torch.no_grad():
+                n_gen = 16
+                x_t = torch.randn((n_gen, C, H, W), device=device)  # start from pure noise
+                for step in range(n_inference_steps):
+                    t_scalar = float(step / n_inference_steps)
+                    t_batch = torch.full((n_gen,), t_scalar, device=device, dtype=torch.float32)
+                    v_pred = model(x_t.float(), (1000 * t_batch)).sample
+                    x_t = x_t + v_pred / n_inference_steps
+                x_t = (x_t + 1.0) / 2.0  # scale back to [0,1]
+                x_train_sample = next(iter(dl))[0][:16].to(device)
+                x_t = torch.cat([x_train_sample, x_t], dim=0)
+                x_t.clamp_(0.0, 1.0)
+                grid = vutils.make_grid(x_t.cpu(), nrow=8, normalize=True, pad_value=1.0)
+                print("Grid shape:", grid.shape)
+                plt.imshow(grid.permute(1, 2, 0))
+                plt.axis("off")
+                plt.show()
+            model.train()
 
 
 def run_diffusion_model():
@@ -208,7 +281,8 @@ def main():
 
     #run_autoencoder(dl)
     #run_diffusion_model()
-    run_ffs_model()
+    #run_ffs_model()
+    run_ffs_midi_model()
 
 
 
