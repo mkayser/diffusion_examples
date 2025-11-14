@@ -21,9 +21,11 @@ class ResBlock(nn.Module):
         return out
 
 
-def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
+def timestep_embedding(t: torch.Tensor, 
+                       dim: int,
+                       device: torch.device|str = "cpu") -> torch.Tensor:
     half = dim // 2
-    freqs = torch.exp(-math.log(1e4) * torch.arange(half) / half)  # 1/ω_k
+    freqs = torch.exp(-math.log(1e4) * torch.arange(half,device=device) / half)  # 1/ω_k
     args  = t[:, None] * freqs[None]                                # (B, half)
     emb   = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)   # (B, dim)
     return emb
@@ -41,23 +43,31 @@ class MLP(nn.Module):
         return self.net(x)
 
 class SimpleResNetWithTimeInput(nn.Module):
-    def __init__(self, c_in: int, temb_dim: int, c_internal: int):
+    def __init__(self, 
+                 c_in: int, 
+                 temb_dim: int, 
+                 c_internal: int,
+                 device: torch.device|str="cpu"):
         super(SimpleResNetWithTimeInput, self).__init__()
         self.temb_dim = temb_dim
         self.conv_in = nn.Conv2d(c_in, c_internal, kernel_size=3, padding=1)
         self.time_mlp = MLP(temb_dim, 256, c_internal)
         self.resblock1 = ResBlock(c_internal)
         self.resblock2 = ResBlock(c_internal)
+        #self.resblock3 = ResBlock(c_internal)
+        #self.resblock4 = ResBlock(c_internal)
         self.conv_out = nn.Conv2d(c_internal, c_in, kernel_size=3, padding=1)
+        self._device = device
+        self.to(device)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor):
-        temb = self.time_mlp(timestep_embedding(t, self.temb_dim))   # B, c_internal
+        temb = self.time_mlp(timestep_embedding(t, self.temb_dim, device=self._device))   # B, c_internal
         temb_broadcast = temb[:, :, None, None]  # B, c_internal, 1, 1
-        h = self.conv_in(x)   # B, c_internal, H, W
-        h = h + temb_broadcast   # B, c_internal, H, W
-        h = self.resblock1(h)
-        h = h + temb_broadcast
-        h = self.resblock2(h)
+        h = self.conv_in(x) + temb_broadcast     # B, c_internal, H, W
+        h = self.resblock1(h) + temb_broadcast   # B, c_internal, H, W
+        h = self.resblock2(h)                    # B, c_internal, H, W
+        #h = self.resblock3(h) + temb_broadcast   # B, c_internal, H, W
+        #h = self.resblock4(h)
         out = self.conv_out(h)  # B, c_in, H, W
         return out
     
