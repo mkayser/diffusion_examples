@@ -46,6 +46,7 @@ def run_ffs_model():
         ds.targets = ds.targets[:truncate_training_data_to]
     dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
     C, H, W = next(iter(dl))[0].shape[1:]  # get image shape
+    print("C,H,W:", C, H, W)
 
     #model = models.SimpleResNetWithTimeInput(1, 32, 16, device=device)
 
@@ -114,11 +115,12 @@ def run_ffs_midi_model():
     
     batch_size = 16
     #K = 4  # data augmentation factor
-    n_epochs = 500
+    n_epochs = 1500
     lr = 1e-3
-    truncate_training_data_to = 100
+    dataset_size = 100
+    #truncate_training_data_to = 10
     n_inference_steps = 50
-    perform_inference_every = 10
+    perform_inference_every = 20
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     #tfm = transforms.Compose([transforms.Resize((8,8), antialias=True), transforms.ToTensor()])
@@ -129,7 +131,7 @@ def run_ffs_midi_model():
         midi_filenames=[str(p) for p in midi_paths[:1]],
         sample_hz=30,
         window_width=100,
-        n_samples=100,
+        n_samples=dataset_size,
         materialize_all=False
     )
 
@@ -138,16 +140,36 @@ def run_ffs_midi_model():
     #    ds.targets = ds.targets[:truncate_training_data_to]
     
     dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
-    C, H, W = next(iter(dl))[0].shape[1:]  # get image shape
+    C, H, W = next(iter(dl))[0].shape  # get image shape
+    print("C,H,W:", C, H, W)
 
-    model = models.SimpleResNetWithTimeInput(1, 32, 16, device=device)
+    #model = models.SimpleResNetWithTimeInput(1, 32, 16, device=device)
+    model = UNet2DModel(
+        sample_size=(H,W),  # the target image resolution
+        in_channels=1,  # the number of input channels, 3 for RGB images
+        out_channels=1,  # the number of output channels
+        layers_per_block=2,  # how many ResNet layers to use per UNet block
+        block_out_channels=(32, 64, 64),  # Roughly matching our basic unet example
+        down_block_types=(
+            "DownBlock2D",  # a regular ResNet downsampling block
+            "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
+            "AttnDownBlock2D",
+        ),
+        up_block_types=(
+            "AttnUpBlock2D",
+            "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
+            "UpBlock2D",  # a regular ResNet upsampling block
+        ),
+    )
+    model = model.to(device)
+
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     for epoch in range(n_epochs):
         epoch_loss = 0.0
-        for x, _ in dl:
+        for x in dl:
             B = x.size(0)
             x1 = x.to(device)*2-1.0  # scale to [-1,1]
             x0 = torch.randn_like(x1)
@@ -174,7 +196,9 @@ def run_ffs_midi_model():
                     v_pred = model(x_t.float(), (1000 * t_batch)).sample
                     x_t = x_t + v_pred / n_inference_steps
                 x_t = (x_t + 1.0) / 2.0  # scale back to [0,1]
-                x_train_sample = next(iter(dl))[0][:16].to(device)
+                x_train_sample = next(iter(dl))[:16].to(device)
+                print("x_train_sample shape:", x_train_sample.shape)
+                print("x_t shape:", x_t.shape)
                 x_t = torch.cat([x_train_sample, x_t], dim=0)
                 x_t.clamp_(0.0, 1.0)
                 grid = vutils.make_grid(x_t.cpu(), nrow=8, normalize=True, pad_value=1.0)

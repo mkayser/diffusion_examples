@@ -128,7 +128,8 @@ class MaestroMIDIPianoRollImageDataset(Dataset):
                  sample_hz: int, 
                  window_width: int,
                  n_samples: int,
-                 materialize_all: bool = False):
+                 materialize_all: bool = False,
+                 rng_seed: int = 42):
         self.sample_hz:int = sample_hz
         self.C = 1
         self.H:int = 88
@@ -137,6 +138,7 @@ class MaestroMIDIPianoRollImageDataset(Dataset):
         self.sr = sample_hz
         self.materialize_all = materialize_all
         self.backing_images:List[torch.Tensor] = list(self._load_backing_images(midi_filenames))
+        self.rng = torch.Generator().manual_seed(rng_seed)
 
         self.precomputed_windows = list(self._load_precomputed_windows())
 
@@ -150,7 +152,7 @@ class MaestroMIDIPianoRollImageDataset(Dataset):
         valid_start_indices = [image_length - self.W for image_length in image_lengths]
         n_valid_indices = sum(valid_start_indices)
         assert n_valid_indices > 0, "No valid windows available in backing images."
-        chosen_indices = torch.randint(0, n_valid_indices, (self.n,))
+        chosen_indices = torch.randint(0, n_valid_indices, (self.n,), generator=self.rng)
         for idx in chosen_indices:
             # Find which backing image this index falls into
             cumulative = 0
@@ -180,7 +182,8 @@ class MaestroMIDIPianoRollImageDataset(Dataset):
             assert False, "Not implemented yet"
         else:
             img_idx, start_idx = self.precomputed_windows[i]
-            return self.backing_images[img_idx][:, :, start_idx:start_idx + self.W]
+            img = self.backing_images[img_idx][:, :, start_idx:start_idx + self.W]
+            return img
         
 
 if __name__ == "__main__":
