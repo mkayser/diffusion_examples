@@ -4,8 +4,14 @@ from enum import Enum, auto
 from typing import Optional
 from pathlib import Path
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import datasets as mydatasets
+import matplotlib.pyplot as plt
+import torchvision.utils as vutils
+import math
+import time
+
 
 
 class Discretization(Enum):
@@ -70,6 +76,79 @@ class PianoRollImageToIntSeqConverter:
         else:
             assert False, f"Invalid discretization: {self.discretization}"
 
+    def convert_back(self, seqs: torch.Tensor) -> torch.Tensor:
+        assert len(seqs.shape) == 2, f"Expected seqs to have shape B,L but got {seqs.shape}"
+        B, L = seqs.shape
+        H, W = self.image_shape
+        output_imgs = torch.zeros((B,1,H,W), dtype=torch.float32, device=seqs.device)
+        PAD, DELIM, BOS, EOS = self.pad_token_id, self.delim_token_id, self.bos_token_id, self.eos_token_id
+
+        if self.discretization == Discretization.ON_OR_OFF:
+            for b in range(B):
+                seq = seqs[b]  # L
+                img = torch.zeros((H,W), dtype=torch.float32, device=seqs.device)
+                w = 0
+                i = 0
+                while i < L:
+                    token = seq[i].item()
+                    if token == BOS:
+                        i += 1
+                    elif token == PAD:
+                        break
+                    elif token == EOS:
+                        break
+                    elif token == DELIM:
+                        w += 1
+                        i += 1
+                    else:
+                        row = H - (token - 1)
+                        if 0 <= row < H and 0 <= w < W:
+                            img[row, w] = 1.0
+                        i += 1
+                output_imgs[b,0,:,:] = img
+        else:
+            assert False, f"Invalid discretization: {self.discretization}"
+        return output_imgs
+
+
+
+
+class PositionalEmbeddingType(Enum):
+    LEARNED_RAW_INDEX = auto()
+
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    def __init__(self, dim: int, max_pos: int = 10000, base: int = 10000):
+        super().__init__()
+        # 1. Handle Odd Dimensions
+        if dim % 2 != 0:
+            raise ValueError("Embedding dimension must be even for sinusoidal encoding")
+            
+        half = dim // 2
+        # 2. Compute frequencies once (The logic from your snippet)
+        freqs = torch.exp(-math.log(base) * torch.arange(half) / half)
+        
+        # 3. Create the grid (0 to max_pos)
+        # We use .arange instead of passing 't' in
+        t = torch.arange(max_pos) 
+        args = t[:, None] * freqs[None] # (Seq_Len, half)
+        
+        # 4. Create the embedding
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1) # (Seq_Len, dim)
+        
+        # 5. Register as buffer so it saves with model but doesn't update via gradient
+        # Unsqueeze to (1, Seq_Len, Dim) to broadcast over Batch
+        self.register_buffer('pe', emb) 
+
+    def forward(self, x: torch.Tensor):
+        # x shape: (Batch, Seq_Len)
+        assert x.dtype in (torch.int8, torch.int16, torch.int32, torch.int64), f"Positional embedding requires integer tensor input"
+        assert len(x.shape) == 2, f"Positional embedding expected shape of length 2 (B, L) but got shape = {x.shape}"
+        B,L = x.shape
+        minpos = 0
+        maxpos = self.pe.shape[1]
+        assert torch.all((x >= minpos) & (x <= maxpos)), f"Positional embedding elements must all be between {minpos} and {maxpos}"
+        return F.embedding(x, self.pe)
 
 
 class VanillaTransformerModel(nn.Module):
@@ -77,16 +156,17 @@ class VanillaTransformerModel(nn.Module):
                  num_layers: int,
                  d_hidden: int,
                  vocab_size: int,
-                 max_seq_len: int,
+                 max_pos: int,
                  pad_token_id: int,
                  bos_token_id: int,
                  eos_token_id: int,
-                 delim_token_id: int):
+                 delim_token_id: int
+                 ):
         super(VanillaTransformerModel, self).__init__()
         self.V = vocab_size
         self.H = d_hidden
         self.input_emb = nn.Embedding(self.V, self.H)
-        self.pos_emb = nn.Embedding(max_seq_len, self.H)
+        self.pos_emb = SinusoidalPositionalEmbedding(self.H, max_pos)
         encoder_layer = nn.TransformerEncoderLayer(self.H, 8, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_emb = nn.Linear(self.H, self.V, bias=False)
@@ -95,6 +175,9 @@ class VanillaTransformerModel(nn.Module):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.delim_token_id = delim_token_id
+
+    def _pos_emb(self, input_ids: torch.Tensor) -> torch.Tensor:
+        pass
 
     def _causal_mask(self, n:int, device:str|torch.device):
         mask = torch.full((n,n), float("-inf"), device=device)
@@ -106,9 +189,12 @@ class VanillaTransformerModel(nn.Module):
         B,T = input_ids.shape
         device = input_ids.device
 
-        positions = torch.arange(T, device=device)
+        # compute positions: for each b,t, pos[b,t] = # delim's that have been observed to the left
+        is_delim = (input_ids == self.delim_token_id)
+        positions = torch.cumsum(is_delim, dim=1)
+
         input_emb = self.input_emb(input_ids)
-        pos_emb = self.pos_emb(positions).unsqueeze(0)
+        pos_emb = self.pos_emb(positions)
         x = input_emb + pos_emb
         mask = self._causal_mask(T, device)
         hidden = self.transformer(x, mask = mask)
@@ -140,22 +226,53 @@ def transformer_train_step(model: VanillaTransformerModel,
     return loss
 
 
+def transformer_inference(model: VanillaTransformerModel,
+                          num_seqs: int,
+                          max_seq_len: int,
+                          temperature: float,
+                          device: str|torch.device,
+                          generator=torch.Generator):
+    model.eval()
+    generated_seqs = torch.full((num_seqs,1), model.bos_token_id, dtype=torch.long, device=device)  # B,1
+    seq_ended = torch.zeros((num_seqs,), dtype=torch.bool, device=device)  # B,
+    with torch.no_grad():
+        for _ in range(max_seq_len-1):
+            logits = model(generated_seqs)  # B,T,V
+            next_token_logits = logits[:,-1,:]  # B,V
+            probs = (next_token_logits / temperature).softmax(dim=-1)
+            next_tokens = torch.multinomial(probs, 1, generator=generator)
+            #next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)  # B,1
+            generated_seqs = torch.cat([generated_seqs, next_tokens], dim=-1)  # B,T+1
+            #print("Generated seqs shape:", generated_seqs.shape)
+            seq_ended |= (next_tokens.squeeze(-1) == model.eos_token_id)
+            seq_ended |= (next_tokens.squeeze(-1) == model.pad_token_id)
+            if seq_ended.all() or generated_seqs.shape[1] >= max_seq_len:
+                break
+
+    model.train()
+    return generated_seqs
+
+
 def transformer_train():
 
+    max_midi_files = 10
     batch_size = 16
-    n_epochs = 100
+    n_epochs = 500
     lr = 1e-4
-    truncate_training_data_to = 100
-    n_inference_steps = 50
-    perform_inference_every = 20
+    truncate_training_data_to = 5000
+    perform_inference_every = 10
     max_seq_len = 500
+    max_seq_len_inference = 500
+    temperature = 1.0
+    n_samples_to_generate = 16
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     generator = torch.Generator().manual_seed(42)
+    inference_generator = torch.Generator(device=device).manual_seed(42)
 
     midi_paths = list(Path("temp_data/maestro-v3.0.0").rglob("*.midi"))
     ds = mydatasets.MaestroMIDIPianoRollImageDataset(
-        midi_filenames=[str(p) for p in midi_paths[:1]],
+        midi_filenames=[str(p) for p in midi_paths[:max_midi_files]],
         sample_hz=30,
         window_width=100,
         n_samples=truncate_training_data_to,
@@ -176,7 +293,7 @@ def transformer_train():
         num_layers=4,
         d_hidden=256,
         vocab_size=H+4,  # note values + BOS + EOS + DELIM + PAD
-        max_seq_len=max_seq_len,
+        max_pos=max_seq_len,
         pad_token_id=0,
         bos_token_id=H+1,
         eos_token_id=H+2,
@@ -186,6 +303,7 @@ def transformer_train():
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
 
     for epoch in range(n_epochs):
+        t0 = time.time()
         epoch_loss = 0.0
         for imgs in dl:
             x = converter.convert(imgs)  # B,L
@@ -193,12 +311,30 @@ def transformer_train():
             loss = transformer_train_step(model, x, criterion, optimizer)
             epoch_loss += loss.item() * x.size(0)
         epoch_loss /= len(dl.dataset)
-        print(f"Epoch {epoch+1}/{n_epochs}, LossPerItem: {epoch_loss:.4f}")
+        dt = time.time() - t0
+        print(f"Epoch {epoch+1}/{n_epochs}, LossPerItem: {epoch_loss:.4f},  Time: {dt:.1f}s")
 
         if (epoch + 1) % perform_inference_every == 0:
             model.eval()
             with torch.no_grad():
-                pass
+                seq_ids = transformer_inference(model, 
+                                                num_seqs=n_samples_to_generate, 
+                                                max_seq_len=max_seq_len_inference,
+                                                temperature=temperature, 
+                                                device=device,
+                                                generator=inference_generator)
+                gen_imgs = converter.convert_back(seq_ids.cpu())  # B,C,H,W
+                print(f"Generated {n_samples_to_generate} samples at epoch {epoch+1}, imgs shape: {gen_imgs.shape}")
+                training_imgs = next(iter(dl))
+                print(f"Training imgs shape: {training_imgs.shape}")
+                all_imgs = torch.cat([training_imgs, gen_imgs], dim=0)
+
+                grid = vutils.make_grid(all_imgs.cpu(), nrow=8, normalize=True, pad_value=1.0)
+                print("Grid shape:", grid.shape)
+                plt.imshow(grid.permute(1, 2, 0))
+                plt.axis("off")
+                plt.show()
+
             model.train()
 
 
